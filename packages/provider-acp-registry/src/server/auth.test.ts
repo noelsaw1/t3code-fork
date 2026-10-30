@@ -4,6 +4,7 @@ import { ProviderInstanceId, type ProviderAuthState } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "../settings.ts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -59,6 +60,7 @@ const makeHarness = (
   failVerification = false,
   settings = decodeSettings({ agentId: "test-agent" }),
   providerInstanceId = instanceId,
+  withPty = true,
 ) =>
   Effect.gen(function* () {
     const verify = yield* Deferred.make<void>();
@@ -152,44 +154,48 @@ const makeHarness = (
             distribution: "binary" as const,
           })),
       }),
-      Effect.provideService(PtyAdapter.PtyAdapter, {
-        spawn: (input) =>
-          Effect.sync(() => {
-            terminalSpawn = input;
-            closedBeforeTerminal = closed.includes(runtimes);
-            return {
-              pid: 123,
-              write: (input) => {
-                written.push(input);
-              },
-              resize: (cols, rows) => {
-                sizes.push([cols, rows]);
-              },
-              kill: () => {
-                killed = true;
-              },
-              onData: (callback) => {
-                data = callback;
-                return () => {
-                  data = undefined;
-                };
-              },
-              onExit: (callback) => {
-                exit = callback;
-                return () => {
-                  exit = undefined;
-                };
-              },
-            };
-          }),
-      }),
+      Effect.provide(
+        withPty
+          ? Layer.succeed(PtyAdapter.PtyAdapter, {
+              spawn: (input) =>
+                Effect.sync(() => {
+                  terminalSpawn = input;
+                  closedBeforeTerminal = closed.includes(runtimes);
+                  return {
+                    pid: 123,
+                    write: (input) => {
+                      written.push(input);
+                    },
+                    resize: (cols, rows) => {
+                      sizes.push([cols, rows]);
+                    },
+                    kill: () => {
+                      killed = true;
+                    },
+                    onData: (callback) => {
+                      data = callback;
+                      return () => {
+                        data = undefined;
+                      };
+                    },
+                    onExit: (callback) => {
+                      exit = callback;
+                      return () => {
+                        exit = undefined;
+                      };
+                    },
+                  };
+                }),
+            })
+          : Layer.empty,
+      ),
     );
     const state = (predicate: (state: ProviderAuthState) => boolean) =>
       controller
         .subscribe("owner")
         .pipe(Stream.filter(predicate), Stream.runHead, Effect.map(Option.getOrThrow));
     const phase = (phase: ProviderAuthState["phase"]) => state((value) => value.phase === phase);
-    yield* state((value) => (value.methods?.length ?? 0) > 0);
+    yield* state((value) => value.methods !== undefined);
     return {
       controller,
       verify,
@@ -267,17 +273,36 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-it.effect(
-  "runs terminal auth directly with the resolved environment and reconnects to verify",
-  () =>
+const terminalCases = [
+  { method: terminalMethod, command: "/managed/agent", args: ["--acp", "login"] },
+  {
+    method: {
+      id: "terminal",
+      name: "Legacy terminal",
+      _meta: {
+        "terminal-auth": {
+          command: "/legacy/agent",
+          args: ["login"],
+          env: { LOGIN: "yes", OVERRIDE: "method" },
+        },
+      },
+    },
+    command: "/legacy/agent",
+    args: ["login"],
+  },
+] as const;
+
+it.effect.each(terminalCases)(
+  "runs $command terminal auth with the resolved environment and reconnects to verify",
+  ({ method, command, args }) =>
     Effect.gen(function* () {
-      const h = yield* makeHarness(terminalMethod);
+      const h = yield* makeHarness(method);
       const flow = yield* h.controller.start("owner", Effect.void, "terminal");
       yield* h.phase("waiting");
       assert.isTrue(h.closedBeforeTerminal());
       assert.deepEqual(h.terminalSpawn(), {
-        shell: "/managed/agent",
-        args: ["--acp", "login"],
+        shell: command,
+        args: [...args],
         cwd: "/workspace",
         cols: 80,
         rows: 24,
@@ -309,6 +334,18 @@ it.effect(
       assert.deepEqual(h.started, [3]);
       assert.deepEqual(h.changed, [true]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(terminalCases)("hides $command terminal login without a PTY", ({ method }) =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness(method, false, undefined, undefined, false);
+    const state = yield* h.state((value) => value.methods !== undefined);
+    assert.deepEqual(state.methods, []);
+    yield* h.controller.start("owner", Effect.void, method.id);
+    yield* h.phase("failed");
+    assert.deepEqual(h.authenticated, []);
+    assert.equal(h.terminalSpawn(), undefined);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.effect("cancels the login PTY and rejects further terminal input", () =>
