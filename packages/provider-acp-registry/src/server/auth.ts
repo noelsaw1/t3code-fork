@@ -13,11 +13,14 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
-import type * as AcpSchema from "effect-acp/compat";
 
 import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
 import * as ProviderAuthFlow from "@t3tools/provider-core/server/providerAuthFlow";
-import { normalizeAcpRegistryAuthMethods, normalizeAcpRegistryWebUrl } from "./probe.ts";
+import {
+  normalizeAcpRegistryAuthMethods,
+  normalizeAcpRegistryWebUrl,
+  resolveAcpRegistryTerminalAuth,
+} from "./probe.ts";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -115,7 +118,7 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
             failure("methods", "Could not discover this agent's sign-in methods.", cause),
           ),
         );
-      const advertised = normalizeAcpRegistryAuthMethods(initialized.authMethods)
+      const advertised = normalizeAcpRegistryAuthMethods(initialized.authMethods, resolved.spawn)
         .filter(
           (method) => method.id.length <= 128 && (method.type !== "terminal" || Option.isSome(pty)),
         )
@@ -154,7 +157,7 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
 
   const runTerminal = Effect.fnUntraced(function* (
     resolved: AcpRegistrySupport.ResolvedAcpRegistryAgent,
-    method: Extract<AcpSchema.AuthMethod, { readonly type: "terminal" }>,
+    login: NonNullable<ReturnType<typeof resolveAcpRegistryTerminalAuth>>,
     context: ProviderAuthFlow.ProviderAuthFlowContext,
   ) {
     if (Option.isNone(pty))
@@ -166,12 +169,12 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
     const output = yield* Queue.sliding<string>(64);
     const process = yield* pty.value
       .spawn({
-        shell: resolved.spawn.command,
-        args: [...resolved.spawn.args, ...(method.args ?? [])],
+        shell: login.command,
+        args: login.args,
         cwd: options.cwd,
         cols: 80,
         rows: 24,
-        env: { ...options.environment, ...resolved.spawn.env, ...method.env },
+        env: { ...options.environment, ...resolved.spawn.env, ...login.env },
       })
       .pipe(
         Effect.mapError((cause) =>
@@ -274,9 +277,10 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
         const method = initialized.authMethods?.find((method) => method.id === methodId);
         if (!method)
           return yield* failure("start", "The agent no longer advertises this sign-in method.");
-        if (method.type === "terminal") {
+        const terminalLogin = resolveAcpRegistryTerminalAuth(method, resolved.spawn);
+        if (terminalLogin !== undefined) {
           yield* Scope.close(runtimeScope, Exit.void);
-          yield* runTerminal(resolved, method, context).pipe(Effect.scoped);
+          yield* runTerminal(resolved, terminalLogin, context).pipe(Effect.scoped);
           // Terminal login is a separate invocation. Reconnect after it exits so
           // the ACP process reads the credentials its login command persisted.
           const verifiedRuntime = yield* makeRuntime(resolved.spawn);

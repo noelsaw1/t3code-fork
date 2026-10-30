@@ -96,15 +96,35 @@ describe("ACP Registry probe", () => {
     });
   });
 
-  it("composes runnable terminal auth commands from the resolved spawn recipe", () => {
+  it.each([
+    {
+      method: {
+        type: "terminal" as const,
+        args: ["auth", "log in"],
+        env: { FORCE_TTY: "1" },
+        _meta: { "terminal-auth": { command: "/ignored", args: ["login"] } },
+      },
+      command: "FORCE_TTY=1 /opt/agents/devin --acp auth 'log in'",
+    },
+    {
+      method: {
+        _meta: {
+          "terminal-auth": {
+            command: "/opt/legacy agent",
+            args: ["login"],
+            env: { FORCE_TTY: "1" },
+          },
+        },
+      },
+      command: "FORCE_TTY=1 '/opt/legacy agent' login",
+    },
+  ])("composes runnable terminal auth commands: $command", ({ method, command }) => {
     const methods = normalizeAcpRegistryAuthMethods(
       [
         {
           id: "login",
           name: "Terminal login",
-          type: "terminal",
-          args: ["auth", "log in"],
-          env: { FORCE_TTY: "1" },
+          ...method,
         },
       ],
       { command: "/opt/agents/devin", args: ["--acp"] },
@@ -116,7 +136,7 @@ describe("ACP Registry probe", () => {
         name: "Terminal login",
         description: null,
         type: "terminal",
-        command: "FORCE_TTY=1 /opt/agents/devin --acp auth 'log in'",
+        command,
       },
     ]);
   });
@@ -135,6 +155,23 @@ describe("ACP Registry probe", () => {
     );
 
     expect(methods[0]).not.toHaveProperty("command");
+
+    for (const method of [
+      { _meta: { "terminal-auth": { command: "" } } },
+      { _meta: { "terminal-auth": { command: "/agent", args: [42] } } },
+      { _meta: { "terminal-auth": { command: "/agent", env: { TOKEN: 42 } } } },
+      {
+        type: "agent" as const,
+        _meta: { "terminal-auth": { command: "/ignored", args: ["login"] } },
+      },
+    ]) {
+      expect(
+        normalizeAcpRegistryAuthMethods([{ id: "login", name: "Login", ...method }], {
+          command: "/managed/agent",
+          args: ["acp"],
+        }),
+      ).toEqual([{ id: "login", name: "Login", description: null, type: "agent" }]);
+    }
   });
 
   it("omits overlong opaque model ids instead of publishing mutated ids", () => {

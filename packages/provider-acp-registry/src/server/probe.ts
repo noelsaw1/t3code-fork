@@ -19,6 +19,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import type * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
@@ -98,6 +99,35 @@ export interface AcpRegistryAuthSpawnContext {
   readonly args: ReadonlyArray<string>;
 }
 
+const decodeLegacyTerminalAuth = Schema.decodeUnknownOption(
+  Schema.Struct({
+    command: Schema.NonEmptyString,
+    args: Schema.optionalKey(Schema.Array(Schema.String)),
+    env: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+  }),
+);
+
+export function resolveAcpRegistryTerminalAuth(
+  method: EffectAcpSchema.AuthMethod,
+  spawn?: AcpRegistryAuthSpawnContext,
+) {
+  if (method.type === "terminal" && spawn !== undefined) {
+    return {
+      command: spawn.command,
+      args: [...spawn.args, ...(method.args ?? [])],
+      env: method.env ?? {},
+    };
+  }
+  if (method.type !== undefined) return undefined;
+  const legacy = decodeLegacyTerminalAuth(method._meta?.["terminal-auth"]);
+  if (Option.isNone(legacy)) return undefined;
+  return {
+    command: legacy.value.command,
+    args: [...(legacy.value.args ?? [])],
+    env: legacy.value.env ?? {},
+  };
+}
+
 const SHELL_SAFE_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/u;
 
 function shellDisplayToken(token: string): string {
@@ -105,13 +135,12 @@ function shellDisplayToken(token: string): string {
 }
 
 function terminalAuthCommand(
-  method: Extract<EffectAcpSchema.AuthMethod, { readonly type: "terminal" }>,
-  spawn: AcpRegistryAuthSpawnContext,
+  login: NonNullable<ReturnType<typeof resolveAcpRegistryTerminalAuth>>,
 ): string | undefined {
-  const environmentPrefix = Object.entries(method.env ?? {}).map(
+  const environmentPrefix = Object.entries(login.env).map(
     ([name, value]) => `${name}=${shellDisplayToken(value)}`,
   );
-  const command = [spawn.command, ...spawn.args, ...(method.args ?? [])].map(shellDisplayToken);
+  const command = [login.command, ...login.args].map(shellDisplayToken);
   const displayCommand = [...environmentPrefix, ...command].join(" ");
   return displayCommand.length <= MAX_COMMAND_LINE_LENGTH ? displayCommand : undefined;
 }
@@ -124,7 +153,8 @@ export function normalizeAcpRegistryAuthMethods(
   for (const method of methods ?? []) {
     const id = boundedOpaqueValue(method.id, MAX_ID_LENGTH);
     if (id === undefined) continue;
-    const type = method.type ?? "agent";
+    const login = resolveAcpRegistryTerminalAuth(method, spawn);
+    const type = login !== undefined ? "terminal" : (method.type ?? "agent");
     const envVarNames =
       type === "env_var" && "vars" in method
         ? method.vars
@@ -135,9 +165,7 @@ export function normalizeAcpRegistryAuthMethods(
             .slice(0, 16)
         : [];
     const command =
-      spawn !== undefined && "type" in method && method.type === "terminal"
-        ? terminalAuthCommand(method, spawn)
-        : undefined;
+      spawn !== undefined && login !== undefined ? terminalAuthCommand(login) : undefined;
     const link =
       type === "env_var" && "link" in method && method.link
         ? normalizeAcpRegistryWebUrl(method.link)
