@@ -438,12 +438,24 @@ it.layer(layerTest)("delegated completion delivery repairs", (it) => {
           Stream.take(1),
           Stream.runDrain,
         );
+        yield* orchestrator.recoverDelegatedTasks;
         const finished = yield* orchestrator.getThreadProjection(threadId);
         const lateTask = finished.subagents.find((task) => task.id === delegated.id)!;
         assert.equal(lateTask.status, "completed");
         assert.isNotNull(lateTask.result);
         assert.equal(lateTask.completionDelivery?.state, "disposed");
         assert.deepEqual(finished.runs, newer.runs);
+        assert.deepEqual(
+          finished.messages
+            .filter((message) => message.parentHandoff !== undefined)
+            .map((message) => ({ id: message.id, check: message.parentHandoff })),
+          [
+            {
+              id: delivery.messageId,
+              check: { state: "missing", taskIds: delivery.taskIds, checkedRunId: wake.id },
+            },
+          ],
+        );
         assert.deepEqual(
           finished.messages.map(({ parentHandoff: _check, ...message }) => message),
           newer.messages.map(({ parentHandoff: _check, ...message }) => message),
@@ -1331,10 +1343,65 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
           cancelledBeforeStart: false,
           monitor: true,
         },
-      ].map((testCase, caseId) => ({ ...testCase, caseId, monitor: "monitor" in testCase })),
+        {
+          response: "Handoff: complete\nOutcome: delivered before unrelated follow-up",
+          present: true,
+          background: false,
+          cancelledBeforeStart: false,
+          ordinary: true,
+        },
+        {
+          response: "Partial work before provider failure",
+          present: false,
+          background: false,
+          cancelledBeforeStart: false,
+          terminal: "failed" as const,
+        },
+        {
+          response: "Partial work before provider disconnect",
+          present: false,
+          background: false,
+          cancelledBeforeStart: false,
+          terminal: "interrupted" as const,
+        },
+        {
+          response: "The direct result was read, but no recap was supplied",
+          present: false,
+          background: false,
+          cancelledBeforeStart: false,
+          directRead: true,
+        },
+        {
+          response: "A status echo with an injected annotation write failure",
+          present: false,
+          background: false,
+          cancelledBeforeStart: false,
+          ordinary: true,
+          failCheck: true,
+        },
+      ].map((testCase, caseId) => ({
+        ...testCase,
+        caseId,
+        monitor: "monitor" in testCase,
+        ordinary: "ordinary" in testCase,
+        directRead: "directRead" in testCase,
+        failCheck: "failCheck" in testCase,
+        terminal: "terminal" in testCase ? testCase.terminal : ("completed" as const),
+      })),
     )(
       "checks a parent handoff while preserving checkpoint completion: $present",
-      ({ response, present, background, cancelledBeforeStart, caseId, monitor }) =>
+      ({
+        response,
+        present,
+        background,
+        cancelledBeforeStart,
+        caseId,
+        monitor,
+        ordinary,
+        terminal,
+        directRead,
+        failCheck,
+      }) =>
         Effect.gen(function* () {
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           const sink = yield* EventSink.EventSinkV2;
@@ -1475,6 +1542,63 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
           );
           assert.isDefined(deliveryRun);
           assert.notEqual(deliveryRun?.status, "queued");
+          if (directRead) {
+            const input = delivered.messages.find((message) => message.id === delivery.messageId)!;
+            const { parentHandoff: _check, ...unarmed } = input;
+            yield* sink.write({
+              events: [
+                {
+                  id: EventId.make(`event:unarm-${caseId}`),
+                  type: "message.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: unarmed,
+                },
+              ],
+            });
+            yield* orchestrator.dispatch({
+              type: "delegated_task.completion-delivery.acknowledge",
+              commandId: CommandId.make(`command:direct-read-${caseId}`),
+              parentThreadId: threadId,
+              taskId: child.taskId,
+              observedByRunId: deliveryRun!.id,
+            });
+            const observed = yield* orchestrator.getThreadProjection(threadId);
+            assert.deepEqual(
+              observed.messages.find((message) => message.id === input.id)?.parentHandoff,
+              { state: "pending", taskIds: [child.taskId] },
+            );
+          }
+          const annotationWrite = sink.writeWithEffects;
+          let injected = false;
+          using _annotationFailure = vi
+            .spyOn(sink, "writeWithEffects")
+            .mockImplementation((input) => {
+              if (
+                failCheck &&
+                input.events.some(
+                  (event) =>
+                    event.type === "message.updated" &&
+                    event.payload.parentHandoff?.state === "missing",
+                )
+              ) {
+                injected = true;
+                return Effect.die("injected handoff annotation failure");
+              }
+              return annotationWrite(input);
+            });
+          if (ordinary)
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make(`command:ordinary-${caseId}`),
+              threadId,
+              messageId: MessageId.make(`message:ordinary-${caseId}`),
+              text: "Unrelated next task",
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+            });
           if (monitor)
             yield* orchestrator.dispatch({
               type: "message.dispatch",
@@ -1544,7 +1668,7 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
                 occurredAt: now,
                 payload: {
                   ...deliveryRun!,
-                  status: cancelledBeforeStart ? "cancelled" : "completed",
+                  status: cancelledBeforeStart ? "cancelled" : terminal,
                   startedAt: cancelledBeforeStart ? null : now,
                   completedAt: now,
                 },
@@ -1557,11 +1681,20 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
             projection.turnItems.filter(
               (item) => item.id === TurnItemId.make(`parent-handoff:${deliveryRun!.id}`),
             );
-          assert.equal(notices(settled).length, present || cancelledBeforeStart ? 0 : 1);
+          assert.equal(
+            notices(settled).length,
+            present || cancelledBeforeStart || failCheck ? 0 : 1,
+          );
           assert.equal(
             settled.messages.find((message) => message.id === delivery.messageId)?.parentHandoff
               ?.state,
-            cancelledBeforeStart ? undefined : present ? "present" : "missing",
+            cancelledBeforeStart
+              ? undefined
+              : failCheck
+                ? "pending"
+                : present
+                  ? "present"
+                  : "missing",
           );
           assert.equal(
             settled.messages.find(
@@ -1572,8 +1705,28 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
           );
           yield* orchestrator.recoverDelegatedTasks;
           const recovered = yield* orchestrator.getThreadProjection(threadId);
-          assert.equal(notices(recovered).length, present || cancelledBeforeStart ? 0 : 1);
+          assert.equal(
+            notices(recovered).length,
+            present || cancelledBeforeStart || failCheck ? 0 : 1,
+          );
           assert.equal(recovered.runs.length, settled.runs.length);
+          if (failCheck) {
+            assert.isTrue(injected);
+            assert.equal(
+              recovered.subagents.find((task) => task.id === child.taskId)?.completionDelivery
+                ?.state,
+              "delivered",
+            );
+            yield* orchestrator.resumeQueuedRuns;
+            const advanced = yield* orchestrator.getThreadProjection(threadId);
+            assert.notEqual(
+              advanced.runs.find(
+                (candidate) =>
+                  candidate.userMessageId === MessageId.make(`message:ordinary-${caseId}`),
+              )?.status,
+              "queued",
+            );
+          }
         }),
     );
     it.effect("pauses queued follow-up cards and resumes them", () =>

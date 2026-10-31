@@ -13117,123 +13117,120 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       : threadDispatch.withLock(parentThreadId, dispatch);
   });
 
-  const checkParentHandoff = Effect.fn("Orchestrator.checkParentHandoff")(function* (
-    threadId: ThreadId,
-    runId: RunId,
-  ) {
-    const inputProjection = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
-      messageRunIds: [runId],
-      messageRoles: ["user"],
-    });
-    const inputs = inputProjection.messages.filter(
-      (message) => message.parentHandoff?.state === "pending",
-    );
-    if (inputs.length === 0) return;
-    const projection = yield* projectionStore.getThreadRecords(
-      threadId,
-      ["runs", "messages", "subagents", "runtimeRequests", "providerThreads"],
-      { messageRunIds: [runId], messageRoles: ["assistant"] },
-    );
-    const run = projection.runs.find((row) => row.id === runId);
-    if (run === undefined || delegatedTaskTerminalStatus(run.status) === null) return;
-    if (run.status === "cancelled" && run.startedAt === null) {
-      yield* writeSystemEvents(
-        inputs.map(({ parentHandoff: _check, ...message }) => ({
-          type: "message.updated" as const,
-          threadId,
-          runId,
-          occurredAt: message.updatedAt,
-          payload: message,
-        })),
+  const checkParentHandoff = Effect.fn("Orchestrator.checkParentHandoff")(
+    function* (threadId: ThreadId, runId: RunId) {
+      const inputProjection = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
+        messageRunIds: [runId],
+        messageRoles: ["user"],
+      });
+      const inputs = inputProjection.messages.filter(
+        (message) => message.parentHandoff?.state === "pending",
       );
-      return;
-    }
-    const taskIds = [...new Set(inputs.flatMap((message) => message.parentHandoff!.taskIds))];
-    const text = projection.messages
-      .filter((message) => message.role === "assistant" && message.runId === runId)
-      .map((message) => message.text)
-      .join("\n");
-    const activeRunIds = projection.runs
-      .filter(
-        (candidate) =>
-          delegatedTaskTerminalStatus(candidate.status) === null &&
-          candidate.status !== "rolled_back",
-      )
-      .map((candidate) => candidate.id);
-    const progressMessages =
-      activeRunIds.length === 0
-        ? []
-        : (yield* projectionStore.getThreadRecords(threadId, ["messages"], {
-            messageRoles: ["user"],
-            messageRunIds: activeRunIds,
-          })).messages;
-    const progress = delegatedTaskProgress({
-      ...projection,
-      messages: progressMessages,
-      subagents: projection.subagents.filter(
-        (task) => !taskIds.includes(task.id) || !isTerminalDelegatedTaskStatus(task.status),
-      ),
-    });
-    const pending =
-      progress.state !== "result_available" ||
-      projection.runtimeRequests.some((request) => request.status === "pending");
-    const failedResult = projection.subagents.some(
-      (task) =>
-        taskIds.includes(task.id) && ["failed", "cancelled", "interrupted"].includes(task.status),
-    );
-    const present = run.status === "completed" && parentHandoffPresent(text, pending, failedResult);
-    const preservedResults = taskIds
-      .map((id) => {
-        const task = projection.subagents.find((candidate) => candidate.id === id);
-        return `${id}: ${task?.status ?? "unknown"}: ${task?.result?.slice(0, 1200) ?? "result unavailable; inspect the preserved child thread"}`;
-      })
-      .join("\n")
-      .slice(0, DELEGATED_RESULT_INLINE_BYTES);
-    const now = yield* DateTime.now;
-    const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = inputs.map((message) => ({
-      type: "message.updated",
-      threadId,
-      runId,
-      occurredAt: now,
-      payload: {
-        ...message,
-        parentHandoff: {
-          state: present ? "present" : "missing",
-          taskIds: message.parentHandoff!.taskIds,
-          checkedRunId: runId,
-        },
-      },
-    }));
-    if (!present)
-      events.push({
-        type: "turn-item.updated",
+      if (inputs.length === 0) return;
+      const projection = yield* projectionStore.getThreadRecords(
+        threadId,
+        ["runs", "messages", "subagents", "runtimeRequests", "providerThreads"],
+        { messageRunIds: [runId], messageRoles: ["assistant"] },
+      );
+      const run = projection.runs.find((row) => row.id === runId);
+      if (run === undefined || delegatedTaskTerminalStatus(run.status) === null) return;
+      if (run.status === "cancelled" && run.startedAt === null) {
+        yield* writeSystemEvents(
+          inputs.map(({ parentHandoff: _check, ...message }) => ({
+            type: "message.updated" as const,
+            threadId,
+            runId,
+            occurredAt: message.updatedAt,
+            payload: message,
+          })),
+        );
+        return;
+      }
+      const taskIds = [...new Set(inputs.flatMap((message) => message.parentHandoff!.taskIds))];
+      const text = projection.messages
+        .filter((message) => message.role === "assistant" && message.runId === runId)
+        .map((message) => message.text)
+        .join("\n");
+      const progress = delegatedTaskProgress({
+        ...projection,
+        runs: [run],
+        messages: [],
+        subagents: projection.subagents.filter(
+          (task) => !taskIds.includes(task.id) || !isTerminalDelegatedTaskStatus(task.status),
+        ),
+      });
+      const pending =
+        progress.state !== "result_available" ||
+        projection.runtimeRequests.some((request) => request.status === "pending");
+      const failedResult = projection.subagents.some(
+        (task) =>
+          taskIds.includes(task.id) && ["failed", "cancelled", "interrupted"].includes(task.status),
+      );
+      const present =
+        run.status === "completed" && parentHandoffPresent(text, pending, failedResult);
+      const preservedResults = taskIds
+        .map((id) => {
+          const task = projection.subagents.find((candidate) => candidate.id === id);
+          return `${id}: ${task?.status ?? "unknown"}: ${task?.result?.slice(0, 1200) ?? "result unavailable; inspect the preserved child thread"}`;
+        })
+        .join("\n")
+        .slice(0, DELEGATED_RESULT_INLINE_BYTES);
+      const now = yield* DateTime.now;
+      const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = inputs.map((message) => ({
+        type: "message.updated",
         threadId,
         runId,
         occurredAt: now,
         payload: {
-          id: TurnItemId.make(`parent-handoff:${runId}`),
+          ...message,
+          parentHandoff: {
+            state: present ? "present" : "missing",
+            taskIds: message.parentHandoff!.taskIds,
+            checkedRunId: runId,
+          },
+        },
+      }));
+      if (!present)
+        events.push({
+          type: "turn-item.updated",
           threadId,
           runId,
-          nodeId: run.rootNodeId,
-          providerThreadId: run.providerThreadId,
-          providerTurnId: null,
-          nativeItemRef: null,
-          parentItemId: null,
-          ordinal: yield* nextTurnItemOrdinal(projection),
-          status: "completed",
-          startedAt: now,
-          completedAt: now,
-          updatedAt: now,
-          type: "notification",
-          source: { kind: "system" },
-          outcome: "unknown",
-          title: "Parent handoff missing",
-          summary: "Parent handoff missing or structurally inconsistent",
-          detail: `Outcome: not verified. Parent run: ${run.status}. Tasks: ${taskIds.join(", ")}.\nPreserved child reports (not independently verified):\n${preservedResults}\nBuilt and checks: see preserved task results and partial assistant response; verification not established by task status.\nRemaining: reconcile the original request, failed checks and any review cap.\nPreserved: existing conversation, task results and checkpoints are unchanged; publication and external check status unknown.\nNext: review those results and request an actionable recap before deciding whether to continue. No retry or approval was issued.`,
-        },
-      });
-    yield* writeSystemEvents(events);
-  });
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`parent-handoff:${runId}`),
+            threadId,
+            runId,
+            nodeId: run.rootNodeId,
+            providerThreadId: run.providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: yield* nextTurnItemOrdinal(projection),
+            status: "completed",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "notification",
+            source: { kind: "system" },
+            outcome: "unknown",
+            title: "Parent handoff missing",
+            summary: "Parent handoff missing or structurally inconsistent",
+            detail: `Outcome: not verified. Parent run: ${run.status}. Tasks: ${taskIds.join(", ")}.\nPreserved child reports (not independently verified):\n${preservedResults}\nBuilt and checks: see preserved task results and partial assistant response; verification not established by task status.\nRemaining: reconcile the original request, failed checks and any review cap.\nPreserved: existing conversation, task results and checkpoints are unchanged; publication and external check status unknown.\nNext: review those results and request an actionable recap before deciding whether to continue. No retry or approval was issued.`,
+          },
+        });
+      yield* writeSystemEvents(events);
+    },
+    (effect, threadId, runId) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to check parent handoff", {
+            threadId,
+            runId,
+            cause,
+          }),
+        ),
+      ),
+  );
 
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
     function* (stored: OrchestrationV2StoredEvent) {
@@ -13392,10 +13389,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .withLock(
                 threadId,
                 Effect.gen(function* () {
-                  const projection = yield* projectionStore.getThreadRecords(threadId, [
-                    "runs",
-                    "messages",
-                  ]);
+                  const projection = yield* projectionStore.getThreadRecords(
+                    threadId,
+                    ["runs", "messages"],
+                    { messageRoles: ["user"] },
+                  );
                   for (const message of projection.messages) {
                     if (message.parentHandoff?.state === "pending" && message.runId !== null)
                       yield* checkParentHandoff(threadId, message.runId);
