@@ -1,7 +1,9 @@
+import * as Option from "effect/Option";
+import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, it, vi } from "@effect/vitest";
 import {
   ClaudeSettings,
   CommandId,
@@ -125,6 +127,7 @@ const result = (uuid: string, aborted: boolean) =>
 
 const deliveries = [
   "child completion",
+  "child completion steering",
   "scheduled message",
   "user steering",
   "promoted queued message",
@@ -231,7 +234,31 @@ it.effect.each(deliveries)(
           const parent = before.runs[0]!;
           if (parent.rootNodeId === null) return yield* Effect.die("parent has no root node");
           const messageId = MessageId.make("automatic-notice");
-          if (delivery === "child completion") {
+          const sessions = yield* ProviderSessionManagerV2;
+          const getSession = sessions.get;
+          using _steeringCapability = vi.spyOn(sessions, "get").mockImplementation((id) =>
+            getSession(id).pipe(
+              Effect.map((session) =>
+                delivery !== "child completion steering"
+                  ? session
+                  : Option.map(session, (value) => ({
+                      ...value,
+                      providerSession: {
+                        ...value.providerSession,
+                        capabilities: {
+                          ...value.providerSession.capabilities,
+                          turns: {
+                            ...value.providerSession.capabilities.turns,
+                            activeSteeringInterruptsTools: false,
+                          },
+                        },
+                      },
+                    })),
+              ),
+            ),
+          );
+
+          if (delivery === "child completion" || delivery === "child completion steering") {
             const taskId = NodeId.make("completed-child");
             const now = yield* DateTime.now;
             const sink = yield* EventSink.EventSinkV2;
@@ -298,6 +325,12 @@ it.effect.each(deliveries)(
               delegatedCompletion: { parentRunId: parent.id, generation: 1, taskIds: [taskId] },
             };
             yield* orchestrator.dispatch(command);
+            if (delivery === "child completion steering") {
+              const steered = yield* orchestrator.getThreadProjection(threadId);
+              const message = steered.messages.find((candidate) => candidate.id === messageId)!;
+              assert.equal(message.runId, parent.id);
+              assert.deepEqual(message.parentHandoff, { state: "pending", taskIds: [taskId] });
+            }
             yield* orchestrator.dispatch(command);
             yield* orchestrator.recoverDelegatedTasks;
           } else if (delivery === "scheduled message") {
@@ -397,7 +430,9 @@ it.effect.each(deliveries)(
           }
           yield* worker.drain();
           const explicitSteer =
-            delivery === "user steering" || delivery === "promoted queued message";
+            delivery === "user steering" ||
+            delivery === "promoted queued message" ||
+            delivery === "child completion steering";
           assert.equal(batchAbort.signal.aborted, explicitSteer);
           assert.equal(offers.length, explicitSteer ? 2 : 1);
           const finished = yield* watch(

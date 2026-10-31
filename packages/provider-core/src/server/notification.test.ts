@@ -1,3 +1,4 @@
+import { parentHandoffPresent } from "./notification.ts";
 import { assert, describe, it } from "@effect/vitest";
 import {
   MessageId,
@@ -131,5 +132,33 @@ describe("notificationTurnItem", () => {
         childThreadId: ThreadId.make("thread:a"),
       },
     });
+  });
+});
+
+describe("parent handoff structure", () => {
+  it("checks dispositions without asserting semantic truth", () => {
+    assert.isFalse(parentHandoffPresent("Task finished", false));
+    assert.isTrue(
+      parentHandoffPresent(
+        "Handoff: continuing\nOutcome: review\nRemaining: reviewer\nNext: collect\nHandoff: complete\nOutcome: delivered",
+        false,
+      ),
+    );
+    assert.isFalse(parentHandoffPresent("Handoff: complete\nOutcome: done", false, true));
+    assert.isTrue(parentHandoffPresent("Handoff: complete\nOutcome: patch delivered", false));
+    assert.isFalse(parentHandoffPresent("Handoff: complete\nOutcome: patch delivered", true));
+    assert.isTrue(
+      parentHandoffPresent(
+        "Handoff: continuing\nOutcome: review underway\nRemaining: child review\nNext: collect its result",
+        true,
+      ),
+    );
+    assert.isFalse(
+      parentHandoffPresent(
+        "Handoff: continuing\nOutcome: review underway\nRemaining: child review\nNext: collect its result",
+        false,
+      ),
+    );
+    assert.isFalse(parentHandoffPresent("Handoff: incomplete\nOutcome: stopped", false));
   });
 });

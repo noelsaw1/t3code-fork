@@ -3876,6 +3876,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               `;
             case "delegated-completions":
               return sql`
+                SELECT message.thread_id FROM orchestration_v2_projection_messages AS message
+                JOIN orchestration_v2_projection_runs AS run ON run.run_id = message.run_id
+                WHERE message.role = 'user' AND run.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                  AND CASE WHEN json_valid(message.payload_json)
+                  THEN json_extract(message.payload_json, '$.parentHandoff.state') = 'pending'
+                  ELSE 0 END
+                UNION
                 SELECT thread_id FROM orchestration_v2_projection_runs
                 WHERE CASE WHEN json_valid(payload_json)
                   THEN json_type(payload_json, '$.delegatedCompletion.delivery') = 'object'

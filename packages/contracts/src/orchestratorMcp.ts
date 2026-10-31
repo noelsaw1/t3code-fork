@@ -202,6 +202,7 @@ export const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT =
 const OrchestratorMcpRunningTaskNext = Schema.Literal(ORCHESTRATOR_MCP_RUNNING_TASK_NEXT);
 
 export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
+  handoffInstruction: Schema.optional(Schema.String),
   taskId: NodeId,
   /** Null for a task that runs in a linked environment; see `remoteChild`. */
   childThreadId: Schema.NullOr(ThreadId),

@@ -1258,6 +1258,13 @@ export const OrchestrationV2IdleCompaction = Schema.Literals(["beforeCacheExpire
 export type OrchestrationV2IdleCompaction = typeof OrchestrationV2IdleCompaction.Type;
 
 export const OrchestrationV2ConversationMessage = Schema.Struct({
+  parentHandoff: Schema.optional(
+    Schema.Struct({
+      state: Schema.Literals(["pending", "present", "missing"]),
+      taskIds: Schema.Array(NodeId),
+      checkedRunId: Schema.optional(RunId),
+    }),
+  ),
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
