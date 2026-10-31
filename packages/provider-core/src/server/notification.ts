@@ -221,3 +221,34 @@ export function notificationTurnItem(
   } = item;
   return { ...base, type: "notification", ...notification };
 }
+
+export const parentHandoffInstruction = `After reading delegated results, end with a compact user-facing block:
+Handoff: complete | continuing | incomplete
+Outcome: requested outcome and current state
+Built: completed work (or none)
+Checks: passed, failed, not run or unknown, with evidence/limits
+Remaining: work or blocker (or none)
+Preserved: artifacts, checkpoint and publication state; unknown stays unknown
+Next: recommended action and specific authorization needed (or none)
+For complete, Handoff and Outcome suffice. For continuing, include Remaining and Next naming actual outstanding work. Incomplete requires every field. Preserve failed review verdicts and caps; do not restart capped work or imply approval. This is a structural recap format, not proof of semantic truth.`;
+
+export function parentHandoffPresent(
+  text: string,
+  hasPendingWork: boolean,
+  hasFailedResult = false,
+): boolean {
+  const start = [...text.matchAll(/^Handoff:/gim)].at(-1)?.index;
+  if (start === undefined) return false;
+  const recap = text.slice(start);
+  const field = (name: string) =>
+    new RegExp(`^${name}:[ \\t]*(\\S[^\\n]*)$`, "im").exec(recap)?.[1]?.trim();
+  const disposition = field("Handoff")?.toLowerCase();
+  if (!field("Outcome")) return false;
+  if (disposition === "complete") return !hasPendingWork && !hasFailedResult;
+  if (disposition === "continuing")
+    return hasPendingWork && !!field("Remaining") && !!field("Next");
+  return (
+    disposition === "incomplete" &&
+    ["Built", "Checks", "Remaining", "Preserved", "Next"].every((name) => !!field(name))
+  );
+}

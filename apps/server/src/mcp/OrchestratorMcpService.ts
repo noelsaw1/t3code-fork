@@ -1,3 +1,4 @@
+import { parentHandoffInstruction } from "@t3tools/provider-core/server/notification";
 import {
   CommandId,
   type RunId,
@@ -1523,6 +1524,7 @@ const make = Effect.gen(function* () {
         model: task.model,
       };
     const result = {
+      ...(isTerminalTaskStatus(status) ? { handoffInstruction: parentHandoffInstruction } : {}),
       taskId: task.id,
       childThreadId: task.childThreadId,
       link: formatThreadLink({
@@ -1682,6 +1684,7 @@ const make = Effect.gen(function* () {
         );
     }
     return {
+      ...(terminal ? { handoffInstruction: parentHandoffInstruction } : {}),
       taskId: task.id,
       childThreadId: null,
       ...(task.remoteChild === undefined

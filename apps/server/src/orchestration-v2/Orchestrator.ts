@@ -104,7 +104,11 @@ import {
 } from "./CommandPolicy.ts";
 import { CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
 import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
-import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
+import {
+  parentHandoffInstruction,
+  parentHandoffPresent,
+  notificationTurnItem,
+} from "@t3tools/provider-core/server/notification";
 import {
   cancelledBeforeStart,
   isRestartContinuationSource,
@@ -695,21 +699,25 @@ function delegatedCompletionWakeDetail(
   tasks: ReadonlyArray<OrchestrationV2Subagent>,
 ): string {
   let remainingBytes = DELEGATED_RESULT_INLINE_BYTES;
-  return taskIds
-    .map((taskId) => {
-      const task = tasks.find((candidate) => candidate.id === taskId);
-      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}`;
-      if (task?.result != null) {
-        const detail = `${label}:\n${task.result}`;
-        const bytes = Buffer.byteLength(detail);
-        if (bytes <= remainingBytes) {
-          remainingBytes -= bytes;
-          return detail;
+  return (
+    taskIds
+      .map((taskId) => {
+        const task = tasks.find((candidate) => candidate.id === taskId);
+        const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}`;
+        if (task?.result != null) {
+          const detail = `${label}:\n${task.result}`;
+          const bytes = Buffer.byteLength(detail);
+          if (bytes <= remainingBytes) {
+            remainingBytes -= bytes;
+            return detail;
+          }
         }
-      }
-      return `${label}. Use task_status with taskId ${taskId} to read the result.`;
-    })
-    .join("\n\n");
+        return `${label}. Use task_status with taskId ${taskId} to read the result.`;
+      })
+      .join("\n\n") +
+    "\n\n" +
+    parentHandoffInstruction
+  );
 }
 
 function isTerminalDelegatedTaskStatus(status: OrchestrationV2Subagent["status"]): boolean {
@@ -2291,6 +2299,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: task,
       });
       return;
+    }
+    if (
+      command.type === "delegated_task.completion-delivery.acknowledge" &&
+      command.observedByRunId != null
+    ) {
+      const observing = projection.runs.find((run) => run.id === command.observedByRunId);
+      const input = projection.messages.find((message) => message.id === observing?.userMessageId);
+      if (input !== undefined) {
+        yield* emitEvent({
+          type: "message.updated",
+          threadId: command.parentThreadId,
+          occurredAt: now,
+          payload: {
+            ...input,
+            parentHandoff: {
+              state: "pending",
+              taskIds: [...new Set([...(input.parentHandoff?.taskIds ?? []), task.id])],
+            },
+          },
+        });
+      }
     }
     const updatedTask: OrchestrationV2Subagent = {
       ...task,
@@ -4519,7 +4548,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           creationSource: input.creationSource,
           ...(input.delegatedCompletion === undefined
             ? {}
-            : { delegatedCompletion: input.delegatedCompletion }),
+            : {
+                delegatedCompletion: input.delegatedCompletion,
+                parentHandoff: {
+                  state: "pending" as const,
+                  taskIds: input.delegatedCompletion.taskIds,
+                },
+              }),
           ...(input.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: input.scheduledTaskId }),
@@ -5763,7 +5798,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         streaming: false,
         createdAt: now,
         updatedAt: now,
-        ...(delegatedCompletion === undefined ? {} : { delegatedCompletion }),
+        ...(delegatedCompletion === undefined
+          ? {}
+          : {
+              delegatedCompletion,
+              parentHandoff: { state: "pending" as const, taskIds: delegatedCompletion.taskIds },
+            }),
         ...(command.notification === undefined ? {} : { notification: command.notification }),
       };
       const emitEvent = emit(events, command);
@@ -6110,7 +6150,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         streaming: false,
         createdAt: now,
         updatedAt: now,
-        ...(delegatedCompletion === undefined ? {} : { delegatedCompletion }),
+        ...(delegatedCompletion === undefined
+          ? {}
+          : {
+              delegatedCompletion,
+              parentHandoff: { state: "pending" as const, taskIds: delegatedCompletion.taskIds },
+            }),
         ...(command.notification === undefined ? {} : { notification: command.notification }),
       };
       const turnItem: OrchestrationV2TurnItem = {
@@ -6799,7 +6844,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       streaming: false,
       createdAt: now,
       updatedAt: now,
-      ...(delegatedCompletion === undefined ? {} : { delegatedCompletion }),
+      ...(delegatedCompletion === undefined
+        ? {}
+        : {
+            delegatedCompletion,
+            parentHandoff: { state: "pending" as const, taskIds: delegatedCompletion.taskIds },
+          }),
       ...(command.notification === undefined ? {} : { notification: command.notification }),
     };
     const turnItem: OrchestrationV2TurnItem = {
@@ -13067,6 +13117,124 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       : threadDispatch.withLock(parentThreadId, dispatch);
   });
 
+  const checkParentHandoff = Effect.fn("Orchestrator.checkParentHandoff")(function* (
+    threadId: ThreadId,
+    runId: RunId,
+  ) {
+    const inputProjection = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
+      messageRunIds: [runId],
+      messageRoles: ["user"],
+    });
+    const inputs = inputProjection.messages.filter(
+      (message) => message.parentHandoff?.state === "pending",
+    );
+    if (inputs.length === 0) return;
+    const projection = yield* projectionStore.getThreadRecords(
+      threadId,
+      ["runs", "messages", "subagents", "runtimeRequests", "providerThreads"],
+      { messageRunIds: [runId], messageRoles: ["assistant"] },
+    );
+    const run = projection.runs.find((row) => row.id === runId);
+    if (run === undefined || delegatedTaskTerminalStatus(run.status) === null) return;
+    if (run.status === "cancelled" && run.startedAt === null) {
+      yield* writeSystemEvents(
+        inputs.map(({ parentHandoff: _check, ...message }) => ({
+          type: "message.updated" as const,
+          threadId,
+          runId,
+          occurredAt: message.updatedAt,
+          payload: message,
+        })),
+      );
+      return;
+    }
+    const taskIds = [...new Set(inputs.flatMap((message) => message.parentHandoff!.taskIds))];
+    const text = projection.messages
+      .filter((message) => message.role === "assistant" && message.runId === runId)
+      .map((message) => message.text)
+      .join("\n");
+    const activeRunIds = projection.runs
+      .filter(
+        (candidate) =>
+          delegatedTaskTerminalStatus(candidate.status) === null &&
+          candidate.status !== "rolled_back",
+      )
+      .map((candidate) => candidate.id);
+    const progressMessages =
+      activeRunIds.length === 0
+        ? []
+        : (yield* projectionStore.getThreadRecords(threadId, ["messages"], {
+            messageRoles: ["user"],
+            messageRunIds: activeRunIds,
+          })).messages;
+    const progress = delegatedTaskProgress({
+      ...projection,
+      messages: progressMessages,
+      subagents: projection.subagents.filter(
+        (task) => !taskIds.includes(task.id) || !isTerminalDelegatedTaskStatus(task.status),
+      ),
+    });
+    const pending =
+      progress.state !== "result_available" ||
+      projection.runtimeRequests.some((request) => request.status === "pending");
+    const failedResult = projection.subagents.some(
+      (task) =>
+        taskIds.includes(task.id) && ["failed", "cancelled", "interrupted"].includes(task.status),
+    );
+    const present = run.status === "completed" && parentHandoffPresent(text, pending, failedResult);
+    const preservedResults = taskIds
+      .map((id) => {
+        const task = projection.subagents.find((candidate) => candidate.id === id);
+        return `${id}: ${task?.status ?? "unknown"}: ${task?.result?.slice(0, 1200) ?? "result unavailable; inspect the preserved child thread"}`;
+      })
+      .join("\n")
+      .slice(0, DELEGATED_RESULT_INLINE_BYTES);
+    const now = yield* DateTime.now;
+    const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = inputs.map((message) => ({
+      type: "message.updated",
+      threadId,
+      runId,
+      occurredAt: now,
+      payload: {
+        ...message,
+        parentHandoff: {
+          state: present ? "present" : "missing",
+          taskIds: message.parentHandoff!.taskIds,
+          checkedRunId: runId,
+        },
+      },
+    }));
+    if (!present)
+      events.push({
+        type: "turn-item.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`parent-handoff:${runId}`),
+          threadId,
+          runId,
+          nodeId: run.rootNodeId,
+          providerThreadId: run.providerThreadId,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* nextTurnItemOrdinal(projection),
+          status: "completed",
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "notification",
+          source: { kind: "system" },
+          outcome: "unknown",
+          title: "Parent handoff missing",
+          summary: "Parent handoff missing or structurally inconsistent",
+          detail: `Outcome: not verified. Parent run: ${run.status}. Tasks: ${taskIds.join(", ")}.\nPreserved child reports (not independently verified):\n${preservedResults}\nBuilt and checks: see preserved task results and partial assistant response; verification not established by task status.\nRemaining: reconcile the original request, failed checks and any review cap.\nPreserved: existing conversation, task results and checkpoints are unchanged; publication and external check status unknown.\nNext: review those results and request an actionable recap before deciding whether to continue. No retry or approval was issued.`,
+        },
+      });
+    yield* writeSystemEvents(events);
+  });
+
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
     function* (stored: OrchestrationV2StoredEvent) {
       if (stored.event.type !== "run.updated") return;
@@ -13078,7 +13246,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (delegatedTaskTerminalStatus(run.status) !== null) {
         yield* threadDispatch.withLock(
           threadId,
-          finalizeDelegatedCompletionDelivery(threadId, run.id),
+          checkParentHandoff(threadId, run.id).pipe(
+            Effect.andThen(finalizeDelegatedCompletionDelivery(threadId, run.id)),
+          ),
         );
         yield* threadDispatch
           .withLock(
@@ -13222,7 +13392,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .withLock(
                 threadId,
                 Effect.gen(function* () {
-                  const projection = yield* projectionStore.getThreadRecords(threadId, ["runs"]);
+                  const projection = yield* projectionStore.getThreadRecords(threadId, [
+                    "runs",
+                    "messages",
+                  ]);
+                  for (const message of projection.messages) {
+                    if (message.parentHandoff?.state === "pending" && message.runId !== null)
+                      yield* checkParentHandoff(threadId, message.runId);
+                  }
                   // Only the current delivery's run can settle its cohort; revisiting historical delivery runs repeatedly reloads the thread.
                   const openDeliveryMessageIds = new Set(
                     projection.runs.flatMap((run) =>
